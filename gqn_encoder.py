@@ -4,15 +4,15 @@ from torch import nn, optim
 from torch.nn import functional as F
 
 class Tower(nn.Module):
-    def __init__(self):
+    def __init__(self, pose_channels=7):
         super(Tower, self).__init__()
 
         self.conv1 = nn.Conv2d(3, 256, 2, stride=2)
         self.conv2 = nn.Conv2d(256, 128, 3, stride=1, padding=1)
         self.res2 = nn.Conv2d(256, 128, 1, stride=1) # Residual connection
         self.conv3 = nn.Conv2d(128, 256, 2, stride=2)
-        self.conv4 = nn.Conv2d(256 + 7, 128, 3, stride=1, padding=1)
-        self.res4 = nn.Conv2d(256 + 7, 128, 1, stride=1) # Residual connection
+        self.conv4 = nn.Conv2d(256 + pose_channels, 128, 3, stride=1, padding=1)
+        self.res4 = nn.Conv2d(256 + pose_channels, 128, 1, stride=1) # Residual connection
         self.conv5 = nn.Conv2d(128, 256, 3, stride=1, padding=1)
         self.conv6 = nn.Conv2d(256, 256, 1, stride=1)
 
