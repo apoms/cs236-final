@@ -4,7 +4,8 @@ from torch import nn, optim
 from torch.nn import functional as F
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
-from gqn_generator import Generator, Inference
+#from gqn_generator import FunctionGenerator, Generator, Inference
+from gqn_deterministic import Renderer
 from gqn_encoder import Tower
 from datasets.gqn_dataset import GQNDataset
 from datasets.scannet_dataset import ScanNetDataset
@@ -31,8 +32,8 @@ PIXEL_SIGMA_INITIAL = 2.0
 PIXEL_SIGMA_FINAL = 0.7
 
 LR_ANNEALING_ITERS = 1.6e6
-LR_INITIAL = 5e-4
-LR_FINAL = 5e-5
+LR_INITIAL = 2e-4
+LR_FINAL = 2e-5
 
 
 def calculate_pixel_sigma(step):
@@ -77,111 +78,6 @@ def encode_representation(net, images, poses):
     return rep
 
 
-def decode_inference_rnn(
-        generator,
-        inference,
-        representation,
-        query_image,
-        query_pose,
-        lstm_layers,
-        cuda=False,
-        debug=False):
-    '''
-    Perform inference of the query_image using the inference and generator
-    networks.
-    '''
-
-    if isinstance(generator, nn.DataParallel):
-        orig_generator = generator.module
-    else:
-        orig_generator = generator
-
-    if isinstance(inference, nn.DataParallel):
-        orig_inference = inference.module
-    else:
-        orig_inference = inference
-
-    batch_size = query_image.shape[0]
-    hidden_g, state_g, u_g = orig_generator.init(batch_size)
-    hidden_i, state_i = orig_inference.init(batch_size)
-
-    if cuda:
-        hidden_g = hidden_g.cuda()
-        state_g = state_g.cuda()
-        u_g = u_g.cuda()
-        hidden_i = hidden_i.cuda()
-        state_i = state_i.cuda()
-
-    inference_time = 0
-    generator_time = 0
-    kl_divs = []
-    for layer in range(lstm_layers):
-        # Prior distribution
-        d_g = orig_generator.prior_distribution(hidden_g)
-
-        # Update inference lstm state
-        s = time.time()
-        hidden_i, state_i = inference(
-            query_image, query_pose, representation, hidden_i, state_i,
-            hidden_g, u_g)
-        inference_time += (time.time() - s)
-
-        # Posterior distribution
-        d_i = orig_inference.posterior_distribution(hidden_i)
-
-        # Posterior sample
-        z_i = d_i.rsample()
-
-        # Update generator lstm state
-        s = time.time()
-        hidden_g, state_g, u_g = generator(query_pose, representation, z_i,
-                                           hidden_g, state_g, u_g)
-        generator_time += (time.time() - s)
-
-        # ELBO KL loss
-        kl_div = torch.distributions.kl.kl_divergence(d_i, d_g)
-        kl_divs.append(kl_div)
-
-    if debug:
-        print('Inference time: {:.2f}'.format(inference_time))
-        print('Generator time: {:.2f}'.format(generator_time))
-
-    return u_g, kl_divs
-
-
-def decode_generator_rnn(generator, representation, query_pose, lstm_layers,
-                         cuda=False):
-    '''
-    Perform inference of the query_image using the generator network.
-    '''
-
-    if isinstance(generator, nn.DataParallel):
-        orig_generator = generator.module
-    else:
-        orig_generator = generator
-
-    batch_size = query_pose.shape[0]
-    hidden_g, state_g, u_g = generator.init(batch_size)
-
-    if cuda:
-        hidden_g = hidden_g.cuda()
-        state_g = state_g.cuda()
-        u_g = u_g.cuda()
-
-    kl_divs = []
-    for layer in range(lstm_layers):
-        # Prior distribution
-        d_g = orig_generator.prior_distribution(hidden_g)
-
-        # Sample from the prior
-        z_g = d_g.sample()
-
-        # Update generator lstm state
-        hidden_g, state_g, u_g = generator(query_pose, representation, z_g,
-                                           hidden_g, state_g, u_g)
-    return u_g
-
-
 def train(args):
     cuda = args.cuda
     BATCH_SIZE = args.batch_size
@@ -216,27 +112,25 @@ def train(args):
     dummy_poses = torch.rand(1, pose_channels, 1, 1)
     dummy_rep = rep_net(dummy_images, dummy_poses)
 
-    generator = Generator(dummy_rep.shape, pose_channels)
-    inference = Inference(dummy_rep.shape, pose_channels)
+    model_settings = {
+        'fn_generator_type': 'DRAW',
+    }
+    renderer = Renderer(dummy_rep.shape, pose_channels, model_settings)
 
     if args.data_parallel:
         dp_rep_net = nn.DataParallel(rep_net)
-        dp_generator = nn.DataParallel(generator)
-        dp_inference = nn.DataParallel(inference)
+        dp_renderer = nn.DataParallel(renderer)
     else:
         dp_rep_net = rep_net
-        dp_generator = generator
-        dp_inference = inference
+        dp_renderer = renderer
 
     if cuda:
         dp_rep_net = dp_rep_net.cuda()
-        dp_generator = dp_generator.cuda()
-        dp_inference = dp_inference.cuda()
+        dp_renderer = dp_renderer.cuda()
 
     model_params = (
         list(dp_rep_net.parameters()) +
-        list(dp_generator.parameters()) +
-        list(dp_inference.parameters()))
+        list(dp_renderer.parameters()))
     optimizer = optim.Adam(model_params, lr=LR_INITIAL)
 
     seed = random.randrange(sys.maxsize)
@@ -249,8 +143,7 @@ def train(args):
         seed = checkpoint['seed']
         optimizer.load_state_dict(checkpoint['optimizer'])
         rep_net.load_state_dict(checkpoint['representation_net'])
-        generator.load_state_dict(checkpoint['generator_net'])
-        inference.load_state_dict(checkpoint['inference_net'])
+        renderer.load_state_dict(checkpoint['renderer_net'])
         resume_step = checkpoint['step']
 
     torch.manual_seed(seed)
@@ -297,58 +190,84 @@ def train(args):
 
             batch_size = frames.shape[0]
 
-            num_context_views = np.random.randint(1, frames.shape[1])
+            num_context_views = np.random.randint(1, frames.shape[1] - 1)
+            num_query_views = min(3, np.random.randint(1, frames.shape[1] - num_context_views))
+
             b = np.random.random(frames.shape[0:2])
             idxs = np.argsort(b, axis=-1)
             input_idx = idxs[:, :num_context_views]
-            query_idx = idxs[:, num_context_views:num_context_views+1]
+            query_idx = idxs[:, num_context_views:num_context_views + num_query_views]
+            all_idx = idxs[:, :num_context_views + num_query_views]
             t = np.arange(frames.shape[0])[:,None]
 
+            all_images = frames[t, all_idx, ...]
+            all_poses = cameras[t, all_idx, ...]
             input_images = frames[t, input_idx, ...]
             input_poses = cameras[t, input_idx, ...]
-            query_image = frames[t, query_idx, ...]
-            query_pose = cameras[t, query_idx, ...]
-
-            query_image = torch.squeeze(query_image, dim=1)
-            query_pose = torch.squeeze(query_pose, dim=1)
+            query_images = frames[t, query_idx, ...]
+            query_poses = cameras[t, query_idx, ...]
 
             if cuda:
+                all_images = all_images.cuda()
+                all_poses = all_poses.cuda()
                 input_images = input_images.cuda()
                 input_poses = input_poses.cuda()
-                query_image = query_image.cuda()
-                query_pose = query_pose.cuda()
+                query_images = query_images.cuda()
+                query_poses = query_poses.cuda()
 
+            # Test time representation
             encode_start = time.time()
-            rep = encode_representation(dp_rep_net, input_images, input_poses)
+            input_rep = encode_representation(dp_rep_net, input_images, input_poses)
             encode_end = time.time()
 
-            decode_start = time.time()
-            u_g, kl_divs = decode_inference_rnn(
-                generator=dp_generator,
-                inference=dp_inference,
-                representation=rep,
-                query_image=query_image,
-                query_pose=query_pose,
-                lstm_layers=LSTM_LAYERS,
-                cuda=cuda,
-                debug=args.debug)
-            decode_end = time.time()
+            # Full representation
+            encode_query_start = time.time()
+            all_rep = encode_representation(dp_rep_net, query_images, all_poses)
+            encode_query_end = time.time()
 
+            # Generator distribution over functions
+            fn_gen_start = time.time()
+            all_global_z_dist, kls = renderer.z_distribution_with_loss(input_rep, all_rep)
+            fn_gen_end = time.time()
+
+            # Sample z vector representing the global variations in the data
+            global_z = all_global_z_dist.rsample()
+
+
+            kl = 0
+            log_likelihood = 1
+            for qi in range(num_query_views):
+                query_image = query_images[:, qi, ...]
+                query_pose = query_poses[:, qi, ...]
+
+                decode_start = time.time()
+                u_g = renderer.forward(global_z, query_pose, query_image, cuda, args.debug)
+                decode_end = time.time()
+
+                # Sum up all the kl divergences for each rendering step
+                #for i in range(1, len(kl_divs)):
+                #    kl += kl_divs[i]
+
+                # Compute generator observation distribution and calculate
+                # probablity of actual observation under that distribution
+                observation_sigma = calculate_pixel_sigma(step)
+                d_obs = renderer.observation_distribution(u_g, observation_sigma)
+                # ELBO reconstruction loss
+                log_likelihood += torch.sum(
+                    torch.mean(d_obs.log_prob(query_image), dim=0))
+                
+            #KL_loss = torch.sum(torch.mean(kl, dim=0)) / num_query_views
+            log_likelihood /= num_query_views
+
+            kl = kls[0]
+            for i in range(1, len(kls)):
+                kl += kls[i]
+            kl_z = torch.sum(torch.mean(kl, dim=0))
+
+            #ELBO = torch.sum(torch.mean(ll_input_z - ll_all_z, dim=0))
             ELBO = 0
-
-            kl = kl_divs[0]
-            for i in range(1, len(kl_divs)):
-                kl += kl_divs[i]
-            ELBO += torch.sum(torch.mean(kl, dim=0))
-
-            KL_loss = ELBO.cpu().data
-
-            # Observation distribution
-            observation_sigma = calculate_pixel_sigma(step)
-            d_obs = generator.observation_distribution(u_g, observation_sigma)
-            # ELBO reconstruction loss
-            log_likelihood = torch.sum(
-                torch.mean(d_obs.log_prob(query_image), dim=0))
+            ELBO += kl_z
+            #ELBO += KL_loss
             ELBO -= log_likelihood
 
             backward_start = time.time()
@@ -367,6 +286,7 @@ def train(args):
             if args.debug:
                 print('Num context views: {:d}'.format(num_context_views))
                 print('Encode time: {:.2f}'.format(encode_end - encode_start))
+                print('Fn Gen time: {:.2f}'.format(fn_gen_end - fn_gen_start))
                 print('Decode time: {:.2f}'.format(decode_end - decode_start))
                 print('Backward time: {:.2f}'.format(backward_end - backward_start))
                 print()
@@ -377,8 +297,11 @@ def train(args):
                 print('Logging step {:d} (epoch {:d}, {:d}/{:d})...'.format(
                     step, e, i_batch, len(train_dataloader)))
                 print('Elapsed time: {:s}'.format(formatted_time))
-                print('KL Loss: ', KL_loss)
+                print('Context views: ', num_context_views)
+                print('Query views: ', num_query_views)
+                #print('KL Loss: ', KL_loss)
                 print('LL Loss: ', log_likelihood.cpu().data)
+                print('KL z Loss: ', kl_z.cpu().data)
                 print('loss: ', loss)
                 print('sigma: ', observation_sigma)
                 print('lr: ', new_lr)
@@ -401,8 +324,9 @@ def train(args):
                     step)
                 writer.add_image(
                     'data/target_image', torchvision.utils.make_grid(query_image), step)
-                writer.add_scalar('data/kl_loss', KL_loss, step)
+                #writer.add_scalar('data/kl_loss', KL_loss, step)
                 writer.add_scalar('data/nll_loss', -log_likelihood.cpu().data, step)
+                writer.add_scalar('data/kl_z_loss', kl_z.cpu().data, step)
                 writer.add_scalar('data/loss', loss, step)
                 writer.add_scalar('param/sigma', observation_sigma, step)
                 writer.add_scalar('param/lr', new_lr, step)
@@ -416,8 +340,7 @@ def train(args):
                     'optimizer': optimizer.state_dict(),
                     'step': step,
                     'representation_net': rep_net.state_dict(),
-                    'generator_net': generator.state_dict(),
-                    'inference_net': inference.state_dict(),
+                    'renderer_net': renderer.state_dict(),
                     'dataset': args.dataset,
                     'seed': seed,
                     'total_time': elapsed_time,
@@ -469,7 +392,7 @@ if __name__ == '__main__':
         '--train-epochs', type=int, default=40,
         help='The number of epochs to train.')
     parser.add_argument(
-        '--batch-size', type=int, default=36,  # 36 reported in GQN paper -> multi-GPU?
+        '--batch-size', type=int, default=8,  # 36 reported in GQN paper -> multi-GPU?
         help='The number of data points per batch. One data point is a tuple of \
         ((query_camera_pose, [(context_frame, context_camera_pose)]), target_frame).')
     # snapshot parameters
