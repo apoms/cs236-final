@@ -13,7 +13,7 @@ U_CHANNELS = 256
 
 
 class VAEFunctionGenerator(nn.Module):
-    def __init__(self, input_shape, model_settings={}):
+    def __init__(self, input_shape, model_settings={}, train=True):
         super(VAEFunctionGenerator, self).__init__()
 
         self._input_shape = input_shape
@@ -152,7 +152,6 @@ class DRAWFunctionGenerator(nn.Module):
         networks.
         '''
         device = input_representation.device
-        
         batch_size = input_representation.shape[0]
         hidden_g, state_g, u_g = self.generator.init(batch_size)
         hidden_i, state_i = self.inference.init(batch_size)

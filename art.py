@@ -1,5 +1,6 @@
 from datasets.gqn_dataset import GQNDataset
 from datasets.scannet_dataset import ScanNetDataset
+from datasets.gibson_dataset import GibsonDataset
 from torch.utils.data import DataLoader
 from gqn_deterministic import Renderer
 from gqn_encoder import Tower
@@ -18,27 +19,43 @@ import scipy.misc
 def main(args):
     # Load the model and a random scene
     print('Loading model and dataset...')
-    dataset = 'rooms_ring_camera'
-    train_dataset = GQNDataset(
-        root_dir=args.data_dir,
-        dataset=dataset,
-        mode='train')
-    test_dataset = GQNDataset(
-        root_dir=args.data_dir,
-        dataset=dataset,
-        mode='test')
-    pose_channels = 7
+    if False:
+        image_shape = (64, 64)
+        dataset = 'rooms_ring_camera'
+        train_dataset = GQNDataset(
+            root_dir=args.data_dir,
+            dataset=dataset,
+            mode='train')
+        test_dataset = GQNDataset(
+            root_dir=args.data_dir,
+            dataset=dataset,
+            mode='test')
+        pose_channels = 7
+    else:
+        image_shape = (128, 128)
+        train_dataset = GibsonDataset(
+            root_dir=args.data_dir,
+            dataset='full',
+            mode='train',
+            resize_shape=image_shape)
+        test_dataset = GibsonDataset(
+            root_dir=args.data_dir,
+            dataset='full',
+            mode='test',
+            resize_shape=image_shape)
+        pose_channels = 7
 
     rep_net = Tower(pose_channels)
 
     # Pass dummy data through the network to get the representation
     # shape for the Generator and Inference networks
-    dummy_images = torch.rand(1, 3, 64, 64)
+    dummy_images = torch.rand(1, 3, *image_shape)
     dummy_poses = torch.rand(1, pose_channels, 1, 1)
     dummy_rep = rep_net(dummy_images, dummy_poses)
 
     model_settings = {
         'fn_generator_type': 'DRAW',
+        #'fn_generator_type': 'VAE',
     }
     renderer = Renderer(dummy_rep.shape, pose_channels, model_settings,
                         train=False)
@@ -64,10 +81,9 @@ def main(args):
     train_dataloader = DataLoader(train_dataset, batch_size=1,
                                   shuffle=True, num_workers=4)
 
-    num_context_views = 3
-    num_query_views = 10 - num_context_views
-    num_examples = 5
-    display_dim = (num_examples * 2, num_context_views + 1 + num_query_views)
+    num_context_views = 4
+    num_query_views = 3 #10 - num_context_views
+    num_examples = 3
     num_frames = 480
     saved_frames = defaultdict(dict)
     context_frames = {}
@@ -83,7 +99,7 @@ def main(args):
         b = np.random.random(frames.shape[0:2])
         idxs = np.argsort(b, axis=-1)
         input_idx = idxs[:, :num_context_views]
-        query_idx = idxs[:, num_context_views:]
+        query_idx = idxs[:, num_context_views:num_context_views + num_query_views]
         t = np.arange(frames.shape[0])[:,None]
 
         input_images = frames[t, input_idx, ...]
@@ -118,20 +134,47 @@ def main(args):
         if args.cuda:
             input_images = input_images.cuda()
             input_poses = input_poses.cuda()
+            query_images = query_images.cuda()
             query_pose = query_pose.cuda()
 
         encode_start = time.time()
         rep = gqn_train.encode_representation(rep_net, input_images, input_poses)
+        #rep = gqn_train.encode_representation(rep_net, query_images, input_poses)
         encode_end = time.time()
 
         posterior_global_z_dist = renderer.z_distribution(rep)
         global_z = posterior_global_z_dist.rsample()
+
+        def render_image(query_pose):
+            with torch.no_grad():
+                if args.cuda:
+                    query_pose = query_pose.cuda()
+                u_g = renderer.forward(global_z, query_pose, None, args.cuda, False)
+                d_obs = renderer.observation_distribution(u_g, 0)
+                obs = d_obs.mean[0,:,:,:].detach().cpu().numpy()
+                obs = 255 * obs / obs.max()
+                obs = obs.astype(int)
+                obs = np.swapaxes(obs, 0, 2)
+                obs = np.swapaxes(obs, 0, 1)
+                return obs
+
+        context = {}
+        for j in range(input_poses.shape[1]):
+            context[j] = render_image(input_poses[:, j, ...])
+        rendered_context_frames[i] = context
+
+        query = {}
+        for j in range(query_poses.shape[1]):
+            query[j] = render_image(query_poses[:, j, ...])
+        rendered_query_frames[i] = query
 
 
         pos = 0
         pitch = 0
         yaw = 0
         r = 0
+
+        continue
         for fi in range(num_frames):
             with torch.no_grad():
                 r += (2 * np.pi) / num_frames
@@ -158,60 +201,46 @@ def main(args):
                 obs = np.swapaxes(obs, 0, 1)
                 saved_frames[i][fi] = obs
 
-        def render_image(query_pose):
-            with torch.no_grad():
-                if args.cuda:
-                    query_pose = query_pose.cuda()
-                u_g = renderer.forward(global_z, query_pose, None, args.cuda, False)
-                d_obs = renderer.observation_distribution(u_g, 0)
-                obs = d_obs.mean[0,:,:,:].detach().cpu().numpy()
-                obs = 255 * obs / obs.max()
-                obs = obs.astype(int)
-                obs = np.swapaxes(obs, 0, 2)
-                obs = np.swapaxes(obs, 0, 1)
-                return obs
-
-        context = {}
-        for j in range(input_poses.shape[1]):
-            context[j] = render_image(input_poses[:, j, ...])
-        rendered_context_frames[i] = context
-
-        query = {}
-        for j in range(query_poses.shape[1]):
-            query[j] = render_image(query_poses[:, j, ...])
-        rendered_query_frames[i] = query
-
     if True:
         # Draw context images side by side with rendered view
-        shape = (display_dim[0] * 64, display_dim[1] * 64, 3)
-        mega_frame = np.zeros(shape, dtype=np.int)
+        h = image_shape[0]
+        w = image_shape[1]
+        y_boundary = 4
+        x_boundary = 8
+        x_stride = image_shape[0]
+        y_stride = image_shape[1] * 2 + y_boundary
+        display_dim = (num_examples, num_context_views + num_query_views)
+        shape = (display_dim[0] * y_stride - y_boundary,
+                 display_dim[1] * x_stride + x_boundary, 3)
+        mega_frame = np.ones(shape, dtype=np.int) * 255
         for i in range(num_examples):
             for v in range(num_context_views):
                 x = v
                 y = i
-                xoff = x * 64
-                yoff = (y * 64) * 2
-                mega_frame[yoff:yoff+64, xoff:xoff+64, :] = context_frames[i][v]
-                mega_frame[yoff+64:yoff+128, xoff:xoff+64, :] = rendered_context_frames[i][v]
+                xoff = x * x_stride
+                yoff = y * y_stride
+                mega_frame[yoff:yoff+h, xoff:xoff+w, :] = context_frames[i][v]
+                mega_frame[yoff+h:yoff+h*2, xoff:xoff+w, :] = rendered_context_frames[i][v]
         # Draw query images
         for i in range(num_examples):
             for v in range(num_query_views):
-                x = v + num_context_views + 1
+                x = v + num_context_views
                 y = i
-                xoff = x * 64
-                yoff = (y * 64) * 2
-                mega_frame[yoff:yoff+64, xoff:xoff+64, :] = query_frames[i][v]
-                mega_frame[yoff+64:yoff+128, xoff:xoff+64, :] = rendered_query_frames[i][v]
+                xoff = x_boundary + x * w
+                yoff = y * y_stride
+                mega_frame[yoff:yoff+h, xoff:xoff+w, :] = query_frames[i][v]
+                mega_frame[yoff+h:yoff+h*2, xoff:xoff+w, :] = rendered_query_frames[i][v]
         # Draw rendered view
-        for fi in range(num_frames):
-            for i in range(num_examples):
-                x = num_context_views
-                y = i
-                xoff = x * 64
-                yoff = (y * 64) * 2
-                mega_frame[yoff:yoff+64, xoff:xoff+64, :] = saved_frames[i][fi]
+        # for fi in range(num_frames):
+        #     for i in range(num_examples):
+        #         x = num_context_views
+        #         y = i
+        #         xoff = x * 64
+        #         yoff = (y * 64) * 2
+        #         mega_frame[yoff:yoff+64, xoff:xoff+64, :] = saved_frames[i][fi]
 
-            scipy.misc.imsave('mega{:d}.png'.format(fi), mega_frame)
+            #scipy.misc.imsave('mega{:d}.png'.format(fi), mega_frame)
+        scipy.misc.imsave('mega.png', mega_frame)
     elif False:
         # Draw rectangular grid 
         shape = (display_dim[0] * 64, display_dim[1] * 64, 3)

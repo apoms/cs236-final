@@ -5,10 +5,12 @@ from torch.nn import functional as F
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
 #from gqn_generator import FunctionGenerator, Generator, Inference
-from gqn_deterministic import Renderer
+import gqn_deterministic 
+import proj_net 
 from gqn_encoder import Tower
 from datasets.gqn_dataset import GQNDataset
 from datasets.scannet_dataset import ScanNetDataset
+from datasets.gibson_dataset import GibsonDataset
 from torch.utils.data import DataLoader
 
 import torch
@@ -24,6 +26,10 @@ import datetime
 import tensorboardX
 import torchvision.utils
 
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+mpl.use('Agg')
+from mpl_toolkits.mplot3d import Axes3D
 
 LSTM_LAYERS = 8
 
@@ -78,6 +84,344 @@ def encode_representation(net, images, poses):
     return rep
 
 
+def gqn_train_iter(args):
+    step = args['step']
+    dp_rep_net = args['dp_rep_net']
+    rep_net = args['rep_net']
+    renderer = args['renderer']
+    optimizer = args['optimizer']
+    input_images = args['input_images']
+    input_poses = args['input_poses']
+    all_images = args['all_images']
+    all_poses = args['all_poses']
+    query_images = args['query_images']
+    query_poses = args['query_poses']
+    writer = args['writer']
+    log_steps = args['log_steps']
+    checkpoint_steps = args['checkpoint_steps']
+    run_path = args['run_path']
+
+    # Test time representation
+    encode_start = time.time()
+    input_rep = encode_representation(dp_rep_net, input_images, input_poses)
+    encode_end = time.time()
+
+    # Full representation
+    encode_query_start = time.time()
+    all_rep = encode_representation(dp_rep_net, all_images, all_poses)
+    encode_query_end = time.time()
+
+    # Generator distribution over functions
+    fn_gen_start = time.time()
+    all_global_z_dist, kls = renderer.z_distribution_with_loss(input_rep, all_rep)
+    fn_gen_end = time.time()
+
+    # Sample z vector representing the global variations in the data
+    global_z = all_global_z_dist.rsample()
+
+
+    kl = 0
+    log_likelihood = 1
+    for qi in range(num_query_views):
+        query_image = query_images[:, qi, ...]
+        query_pose = query_poses[:, qi, ...]
+
+        decode_start = time.time()
+        u_g = renderer.forward(global_z, query_pose, query_image, cuda,
+                               args.debug)
+        decode_end = time.time()
+
+        # Sum up all the kl divergences for each rendering step
+        #for i in range(1, len(kl_divs)):
+        #    kl += kl_divs[i]
+
+        # Compute generator observation distribution and calculate
+        # probablity of actual observation under that distribution
+        observation_sigma = calculate_pixel_sigma(step)
+        d_obs = renderer.observation_distribution(u_g, observation_sigma)
+        # ELBO reconstruction loss
+        log_likelihood += torch.sum(
+            torch.mean(d_obs.log_prob(query_image), dim=0))
+
+    #KL_loss = torch.sum(torch.mean(kl, dim=0)) / num_query_views
+    log_likelihood /= num_query_views
+
+    kl = kls[0]
+    for i in range(1, len(kls)):
+        kl += kls[i]
+    kl_z = torch.sum(torch.mean(kl, dim=0))
+
+    #ELBO = torch.sum(torch.mean(ll_input_z - ll_all_z, dim=0))
+    ELBO = 0
+    ELBO += kl_z
+    #ELBO += KL_loss
+    ELBO -= log_likelihood
+
+    backward_start = time.time()
+
+    loss = ELBO.item()
+    ELBO.backward()
+    optimizer.step()
+
+    backward_end = time.time()
+
+    # Update optimizer learning rate
+    new_lr = calculate_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = new_lr
+
+    if args.debug:
+        print('Num context views: {:d}'.format(num_context_views))
+        print('Encode time: {:.2f}'.format(encode_end - encode_start))
+        print('Fn Gen time: {:.2f}'.format(fn_gen_end - fn_gen_start))
+        print('Decode time: {:.2f}'.format(decode_end - decode_start))
+        print('Backward time: {:.2f}'.format(
+            backward_end - backward_start))
+        print()
+
+    elapsed_time = time.time() - start_time
+    formatted_time = str(datetime.timedelta(seconds=elapsed_time))
+    if step % log_steps == 0:
+        print('Logging step {:d} (epoch {:d}, {:d}/{:d})...'.format(
+            step, e, i_batch, len(train_dataloader)))
+        print('Elapsed time: {:s}'.format(formatted_time))
+        print('Context views: ', num_context_views)
+        print('Query views: ', num_query_views)
+        #print('KL Loss: ', KL_loss)
+        print('LL Loss: ', log_likelihood.cpu().data)
+        print('KL z Loss: ', kl_z.cpu().data)
+        print('loss: ', loss)
+        print('sigma: ', observation_sigma)
+        print('lr: ', new_lr)
+        print('Writing image...')
+        obs = d_obs.mean[0,:,:,:].detach().cpu().numpy()
+        obs = np.swapaxes(obs, 0, 2)
+        obs = np.swapaxes(obs, 0, 1)
+        target = query_image[0,:,:,:].detach().cpu().numpy()
+        target = np.swapaxes(target, 0, 2)
+        target = np.swapaxes(target, 0, 1)
+        img = np.concatenate((target, obs), axis=1)
+        path = get_output_dir(args.run_dir)
+        scipy.misc.imsave(
+            os.path.join(path, 'sample{:06d}.png'.format(step)), img)
+        writer.add_image(
+            'data/obs_image',
+            torchvision.utils.make_grid(
+                d_obs.mean, normalize=True, scale_each=True),
+            step)
+        writer.add_image(
+            'data/target_image', torchvision.utils.make_grid(query_image), step)
+        #writer.add_scalar('data/kl_loss', KL_loss, step)
+        writer.add_scalar('data/nll_loss', -log_likelihood.cpu().data, step)
+        writer.add_scalar('data/kl_z_loss', kl_z.cpu().data, step)
+        writer.add_scalar('data/loss', loss, step)
+        writer.add_scalar('param/sigma', observation_sigma, step)
+        writer.add_scalar('param/lr', new_lr, step)
+        print('Done logging.')
+        print()
+
+    if step % args.checkpoint_steps == 0:
+        print('Checkpointing step {:d}...'.format(step))
+        print('Elapsed time: {:s}'.format(formatted_time))
+        path = get_checkpoint_path(args.run_dir, step)
+        data = {
+            'optimizer': optimizer.state_dict(),
+            'step': step,
+            'representation_net': rep_net.state_dict(),
+            'renderer_net': renderer.state_dict(),
+            'dataset': args.dataset,
+            'seed': seed,
+            'total_time': elapsed_time,
+        }
+        write_checkpoint(path, data)
+        print('Done checkpointing.')
+        print()
+
+    step += 1
+
+    
+def proj_train_iter(args):
+    step = args['step']
+    dp_rep_net = args['dp_rep_net']
+    rep_net = args['rep_net']
+    renderer = args['renderer']
+    optimizer = args['optimizer']
+    input_images = args['input_images']
+    input_poses = args['input_poses']
+    all_images = args['all_images']
+    all_poses = args['all_poses']
+    query_images = args['query_images']
+    query_poses = args['query_poses']
+    writer = args['writer']
+    log_steps = args['log_steps']
+    checkpoint_steps = args['checkpoint_steps']
+    run_path = args['run_path']
+
+
+    def encode_representations(net, images, poses):
+        reps = []
+        for i in range(images.shape[1]):
+            rep = net(images[:, i, ...], poses[:, i, ...])
+            reps.append(rep[:, None,...])
+        return reps
+
+    # Test time representation
+    encode_start = time.time()
+    input_reps = encode_representations(dp_rep_net, input_images, input_poses)
+    encode_end = time.time()
+
+    # Full representation
+    encode_query_start = time.time()
+    all_reps = encode_representations(dp_rep_net, all_images, all_poses)
+    encode_query_end = time.time()
+
+    batch_size = input_images.shape[0]
+    grids = []
+    for b in range(batch_size):
+        shape = [32, 32, 32]
+        bounds = np.array([[-2.0, 2.0], [-2.0, 2.0], [-2.0, 2.0]])
+        grids.append(renderer.init_grid(shape, bounds))
+    # Generator distribution over functions
+    fn_gen_start = time.time()
+
+    fig = plt.figure()
+    ax = fig.gca(projection='3d')
+    ax.set_zlim(-1, 1)
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1, 1)
+    start = time.time()
+    for i in range(len(all_reps)):
+        renderer.trace(grids, all_reps[i], None, all_poses[:, i, ...], ax)
+    print('time to trace all reps {:f}'.format(time.time() - start))
+    plt.show()
+    plt.savefig('3dfig.png')
+    fn_gen_end = time.time()
+    exit(0)
+
+    # Sample z vector representing the global variations in the data
+    global_z = all_global_z_dist.rsample()
+
+
+    kl = 0
+    log_likelihood = 1
+    for qi in range(num_query_views):
+        query_image = query_images[:, qi, ...]
+        query_pose = query_poses[:, qi, ...]
+
+        decode_start = time.time()
+        u_g = renderer.forward(global_z, query_pose, query_image, cuda,
+                               args.debug)
+        decode_end = time.time()
+
+        # Sum up all the kl divergences for each rendering step
+        #for i in range(1, len(kl_divs)):
+        #    kl += kl_divs[i]
+
+        # Compute generator observation distribution and calculate
+        # probablity of actual observation under that distribution
+        observation_sigma = calculate_pixel_sigma(step)
+        d_obs = renderer.observation_distribution(u_g, observation_sigma)
+        # ELBO reconstruction loss
+        log_likelihood += torch.sum(
+            torch.mean(d_obs.log_prob(query_image), dim=0))
+
+    #KL_loss = torch.sum(torch.mean(kl, dim=0)) / num_query_views
+    log_likelihood /= num_query_views
+
+    kl = kls[0]
+    for i in range(1, len(kls)):
+        kl += kls[i]
+    kl_z = torch.sum(torch.mean(kl, dim=0))
+
+    #ELBO = torch.sum(torch.mean(ll_input_z - ll_all_z, dim=0))
+    ELBO = 0
+    ELBO += kl_z
+    #ELBO += KL_loss
+    ELBO -= log_likelihood
+
+    backward_start = time.time()
+
+    loss = ELBO.item()
+    ELBO.backward()
+    optimizer.step()
+
+    backward_end = time.time()
+
+    # Update optimizer learning rate
+    new_lr = calculate_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = new_lr
+
+    if args.debug:
+        print('Num context views: {:d}'.format(num_context_views))
+        print('Encode time: {:.2f}'.format(encode_end - encode_start))
+        print('Fn Gen time: {:.2f}'.format(fn_gen_end - fn_gen_start))
+        print('Decode time: {:.2f}'.format(decode_end - decode_start))
+        print('Backward time: {:.2f}'.format(
+            backward_end - backward_start))
+        print()
+
+    elapsed_time = time.time() - start_time
+    formatted_time = str(datetime.timedelta(seconds=elapsed_time))
+    if step % log_steps == 0:
+        print('Logging step {:d} (epoch {:d}, {:d}/{:d})...'.format(
+            step, e, i_batch, len(train_dataloader)))
+        print('Elapsed time: {:s}'.format(formatted_time))
+        print('Context views: ', num_context_views)
+        print('Query views: ', num_query_views)
+        #print('KL Loss: ', KL_loss)
+        print('LL Loss: ', log_likelihood.cpu().data)
+        print('KL z Loss: ', kl_z.cpu().data)
+        print('loss: ', loss)
+        print('sigma: ', observation_sigma)
+        print('lr: ', new_lr)
+        print('Writing image...')
+        obs = d_obs.mean[0,:,:,:].detach().cpu().numpy()
+        obs = np.swapaxes(obs, 0, 2)
+        obs = np.swapaxes(obs, 0, 1)
+        target = query_image[0,:,:,:].detach().cpu().numpy()
+        target = np.swapaxes(target, 0, 2)
+        target = np.swapaxes(target, 0, 1)
+        img = np.concatenate((target, obs), axis=1)
+        path = get_output_dir(args.run_dir)
+        scipy.misc.imsave(
+            os.path.join(path, 'sample{:06d}.png'.format(step)), img)
+        writer.add_image(
+            'data/obs_image',
+            torchvision.utils.make_grid(
+                d_obs.mean, normalize=True, scale_each=True),
+            step)
+        writer.add_image(
+            'data/target_image', torchvision.utils.make_grid(query_image), step)
+        #writer.add_scalar('data/kl_loss', KL_loss, step)
+        writer.add_scalar('data/nll_loss', -log_likelihood.cpu().data, step)
+        writer.add_scalar('data/kl_z_loss', kl_z.cpu().data, step)
+        writer.add_scalar('data/loss', loss, step)
+        writer.add_scalar('param/sigma', observation_sigma, step)
+        writer.add_scalar('param/lr', new_lr, step)
+        print('Done logging.')
+        print()
+
+    if step % args.checkpoint_steps == 0:
+        print('Checkpointing step {:d}...'.format(step))
+        print('Elapsed time: {:s}'.format(formatted_time))
+        path = get_checkpoint_path(args.run_dir, step)
+        data = {
+            'optimizer': optimizer.state_dict(),
+            'step': step,
+            'representation_net': rep_net.state_dict(),
+            'renderer_net': renderer.state_dict(),
+            'dataset': args.dataset,
+            'seed': seed,
+            'total_time': elapsed_time,
+        }
+        write_checkpoint(path, data)
+        print('Done checkpointing.')
+        print()
+
+    step += 1
+
+
 def train(args):
     cuda = args.cuda
     BATCH_SIZE = args.batch_size
@@ -85,7 +429,31 @@ def train(args):
     writer = tensorboardX.SummaryWriter(
         log_dir=os.path.join(args.run_dir, 'tensorboard'))
 
-    if args.dataset == 'scannet':
+    if args.dataset == 'gibson':
+        train_dataset = GibsonDataset(
+            root_dir=args.data_dir,
+            dataset='tiny',
+            mode='train')
+        test_dataset = GibsonDataset(
+            root_dir=args.data_dir,
+            dataset='tiny',
+            mode='test')
+        pose_channels = 7
+        image_shape = (256, 256)
+    if args.dataset == 'gibson-full':
+        image_shape = (128, 128)
+        train_dataset = GibsonDataset(
+            root_dir=args.data_dir,
+            dataset='full',
+            mode='train',
+            resize_shape=image_shape)
+        test_dataset = GibsonDataset(
+            root_dir=args.data_dir,
+            dataset='full',
+            mode='test',
+            resize_shape=image_shape)
+        pose_channels = 7
+    elif args.dataset == 'scannet':
         train_dataset = ScanNetDataset(
             root_dir=args.data_dir,
             mode='train')
@@ -103,19 +471,37 @@ def train(args):
             dataset=args.dataset,
             mode='test')
         pose_channels = 7
+        image_shape = (64, 64)
 
-    rep_net = Tower(pose_channels)
+    if args.model == 'jump-vae' or args.model == 'jump-draw': 
+        rep_net = Tower(pose_channels)
 
-    # Pass dummy data through the network to get the representation
-    # shape for the Generator and Inference networks
-    dummy_images = torch.rand(1, 3, 64, 64)
-    dummy_poses = torch.rand(1, pose_channels, 1, 1)
-    dummy_rep = rep_net(dummy_images, dummy_poses)
+        # Pass dummy data through the network to get the representation
+        # shape for the Generator and Inference networks
+        dummy_images = torch.rand(1, 3, *image_shape)
+        dummy_poses = torch.rand(1, pose_channels, 1, 1)
+        dummy_rep = rep_net(dummy_images, dummy_poses)
 
-    model_settings = {
-        'fn_generator_type': 'DRAW',
-    }
-    renderer = Renderer(dummy_rep.shape, pose_channels, model_settings)
+        model_settings = {
+            'fn_generator_type': 'DRAW' if args.model == 'jump-draw' else 'VAE',
+        }
+        renderer = gqn_deterministic.Renderer(dummy_rep.shape,
+                                              pose_channels, model_settings)
+        train_fn = gqn_train_iter
+    elif args.model == 'proj': 
+        rep_net = Tower(pose_channels)
+
+        # Pass dummy data through the network to get the representation
+        # shape for the Generator and Inference networks
+        dummy_images = torch.rand(1, 3, *image_shape)
+        dummy_poses = torch.rand(1, pose_channels, 1, 1)
+        dummy_rep = rep_net(dummy_images, dummy_poses)
+
+        renderer = proj_net.Renderer(image_shape, dummy_rep.shape,
+                                     pose_channels, {})
+        train_fn = proj_train_iter
+    else:
+        print('No model of type "{:s}" available.'.format(args.model))
 
     if args.data_parallel:
         dp_rep_net = nn.DataParallel(rep_net)
@@ -190,13 +576,16 @@ def train(args):
 
             batch_size = frames.shape[0]
 
-            num_context_views = np.random.randint(1, frames.shape[1] - 1)
-            num_query_views = min(3, np.random.randint(1, frames.shape[1] - num_context_views))
+            num_context_views = min(
+                6, np.random.randint(1, frames.shape[1] - 1))
+            num_query_views = min(
+                3, np.random.randint(1, frames.shape[1] - num_context_views))
 
             b = np.random.random(frames.shape[0:2])
             idxs = np.argsort(b, axis=-1)
             input_idx = idxs[:, :num_context_views]
-            query_idx = idxs[:, num_context_views:num_context_views + num_query_views]
+            query_idx = \
+                idxs[:, num_context_views:num_context_views + num_query_views]
             all_idx = idxs[:, :num_context_views + num_query_views]
             t = np.arange(frames.shape[0])[:,None]
 
@@ -215,141 +604,27 @@ def train(args):
                 query_images = query_images.cuda()
                 query_poses = query_poses.cuda()
 
-            # Test time representation
-            encode_start = time.time()
-            input_rep = encode_representation(dp_rep_net, input_images, input_poses)
-            encode_end = time.time()
-
-            # Full representation
-            encode_query_start = time.time()
-            all_rep = encode_representation(dp_rep_net, query_images, all_poses)
-            encode_query_end = time.time()
-
-            # Generator distribution over functions
-            fn_gen_start = time.time()
-            all_global_z_dist, kls = renderer.z_distribution_with_loss(input_rep, all_rep)
-            fn_gen_end = time.time()
-
-            # Sample z vector representing the global variations in the data
-            global_z = all_global_z_dist.rsample()
-
-
-            kl = 0
-            log_likelihood = 1
-            for qi in range(num_query_views):
-                query_image = query_images[:, qi, ...]
-                query_pose = query_poses[:, qi, ...]
-
-                decode_start = time.time()
-                u_g = renderer.forward(global_z, query_pose, query_image, cuda, args.debug)
-                decode_end = time.time()
-
-                # Sum up all the kl divergences for each rendering step
-                #for i in range(1, len(kl_divs)):
-                #    kl += kl_divs[i]
-
-                # Compute generator observation distribution and calculate
-                # probablity of actual observation under that distribution
-                observation_sigma = calculate_pixel_sigma(step)
-                d_obs = renderer.observation_distribution(u_g, observation_sigma)
-                # ELBO reconstruction loss
-                log_likelihood += torch.sum(
-                    torch.mean(d_obs.log_prob(query_image), dim=0))
+            train_args = {
+                'step': step,
+                'dp_rep_net': dp_rep_net,
+                'rep_net': rep_net,
+                'renderer': renderer,
+                'optimizer': optimizer,
+                'input_images': input_images,
+                'input_poses': input_poses,
+                'query_images': query_images,
+                'query_poses': query_poses,
+                'all_images': all_images,
+                'all_poses': all_poses,
+                'writer': writer,
+                'log_steps': args.log_steps,
+                'checkpoint_steps': args.checkpoint_steps,
+                'run_path': args.run_dir,
                 
-            #KL_loss = torch.sum(torch.mean(kl, dim=0)) / num_query_views
-            log_likelihood /= num_query_views
+            }
+            #gqn_train_iter(train_args)
+            proj_train_iter(train_args)
 
-            kl = kls[0]
-            for i in range(1, len(kls)):
-                kl += kls[i]
-            kl_z = torch.sum(torch.mean(kl, dim=0))
-
-            #ELBO = torch.sum(torch.mean(ll_input_z - ll_all_z, dim=0))
-            ELBO = 0
-            ELBO += kl_z
-            #ELBO += KL_loss
-            ELBO -= log_likelihood
-
-            backward_start = time.time()
-
-            loss = ELBO.item()
-            ELBO.backward()
-            optimizer.step()
-
-            backward_end = time.time()
-
-            # Update optimizer learning rate
-            new_lr = calculate_lr(step)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = new_lr
-
-            if args.debug:
-                print('Num context views: {:d}'.format(num_context_views))
-                print('Encode time: {:.2f}'.format(encode_end - encode_start))
-                print('Fn Gen time: {:.2f}'.format(fn_gen_end - fn_gen_start))
-                print('Decode time: {:.2f}'.format(decode_end - decode_start))
-                print('Backward time: {:.2f}'.format(backward_end - backward_start))
-                print()
-
-            elapsed_time = time.time() - start_time
-            formatted_time = str(datetime.timedelta(seconds=elapsed_time))
-            if step % args.log_steps == 0:
-                print('Logging step {:d} (epoch {:d}, {:d}/{:d})...'.format(
-                    step, e, i_batch, len(train_dataloader)))
-                print('Elapsed time: {:s}'.format(formatted_time))
-                print('Context views: ', num_context_views)
-                print('Query views: ', num_query_views)
-                #print('KL Loss: ', KL_loss)
-                print('LL Loss: ', log_likelihood.cpu().data)
-                print('KL z Loss: ', kl_z.cpu().data)
-                print('loss: ', loss)
-                print('sigma: ', observation_sigma)
-                print('lr: ', new_lr)
-                print('Writing image...')
-                obs = d_obs.mean[0,:,:,:].detach().cpu().numpy()
-                obs = np.swapaxes(obs, 0, 2)
-                obs = np.swapaxes(obs, 0, 1)
-                target = query_image[0,:,:,:].detach().cpu().numpy()
-                target = np.swapaxes(target, 0, 2)
-                target = np.swapaxes(target, 0, 1)
-                img = np.concatenate((target, obs), axis=1)
-                print(img.shape)
-                path = get_output_dir(args.run_dir)
-                scipy.misc.imsave(
-                    os.path.join(path, 'sample{:06d}.png'.format(step)), img)
-                print('Done logging.')
-                writer.add_image(
-                    'data/obs_image',
-                    torchvision.utils.make_grid(d_obs.mean, normalize=True, scale_each=True),
-                    step)
-                writer.add_image(
-                    'data/target_image', torchvision.utils.make_grid(query_image), step)
-                #writer.add_scalar('data/kl_loss', KL_loss, step)
-                writer.add_scalar('data/nll_loss', -log_likelihood.cpu().data, step)
-                writer.add_scalar('data/kl_z_loss', kl_z.cpu().data, step)
-                writer.add_scalar('data/loss', loss, step)
-                writer.add_scalar('param/sigma', observation_sigma, step)
-                writer.add_scalar('param/lr', new_lr, step)
-                print()
-
-            if step % args.checkpoint_steps == 0:
-                print('Checkpointing step {:d}...'.format(step))
-                print('Elapsed time: {:s}'.format(formatted_time))
-                path = get_checkpoint_path(args.run_dir, step)
-                data = {
-                    'optimizer': optimizer.state_dict(),
-                    'step': step,
-                    'representation_net': rep_net.state_dict(),
-                    'renderer_net': renderer.state_dict(),
-                    'dataset': args.dataset,
-                    'seed': seed,
-                    'total_time': elapsed_time,
-                }
-                write_checkpoint(path, data)
-                print('Done checkpointing.')
-                print()
-
-            step += 1
 
         if args.profiler:
             prof.__exit__(None, None, None)
@@ -382,6 +657,9 @@ if __name__ == '__main__':
         '--resume-from', type=str,
         help='The checkpoint file to resume from.')
     # training parameters
+    parser.add_argument(
+        '--model', type=str, default='jump-vae', 
+        help="The model type to use.")
     parser.add_argument(
         '--cuda', default=False, action='store_true',
         help="Run the model using CUDA.")
